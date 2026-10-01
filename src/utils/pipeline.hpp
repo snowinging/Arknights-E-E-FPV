@@ -1,0 +1,391 @@
+/*
+ * Copyright (C) 2024 Carlos Lopez
+ * SPDX-License-Identifier: MIT
+ */
+
+#pragma once
+
+#include <include/reshade.hpp>
+#include <include/reshade_api_device.hpp>
+#include <include/reshade_api_pipeline.hpp>
+#include <optional>
+#include <span>
+#include <unordered_map>
+#include <vector>
+
+#include "./bitwise.hpp"
+#include "./cstring.hpp"
+#include "./format.hpp"
+#include "./hash.hpp"
+
+namespace renodx::utils::pipeline {
+
+static reshade::api::pipeline_subobject* ClonePipelineSubObjects(const reshade::api::pipeline_subobject* subobjects, uint32_t subobject_count) {
+  auto* new_subobjects = new reshade::api::pipeline_subobject[subobject_count];
+  std::memcpy(new_subobjects, subobjects, sizeof(reshade::api::pipeline_subobject) * subobject_count);
+  for (uint32_t i = 0; i < subobject_count; ++i) {
+    const auto& subobject = subobjects[i];
+#ifdef DEBUG_LEVEL_2
+    {
+      std::stringstream s;
+      s << "utils::pipeline::ClonePipelineSubObjects(cloning " << subobjects[i].type << "[" << i << "]";
+      reshade::log::message(reshade::log::level::debug, s.str().c_str());
+    }
+#endif
+    switch (subobject.type) {
+      case reshade::api::pipeline_subobject_type::vertex_shader:
+      case reshade::api::pipeline_subobject_type::hull_shader:
+      case reshade::api::pipeline_subobject_type::domain_shader:
+      case reshade::api::pipeline_subobject_type::geometry_shader:
+      case reshade::api::pipeline_subobject_type::compute_shader:
+      case reshade::api::pipeline_subobject_type::pixel_shader:
+      case reshade::api::pipeline_subobject_type::amplification_shader:
+      case reshade::api::pipeline_subobject_type::mesh_shader:
+      case reshade::api::pipeline_subobject_type::raygen_shader:
+      case reshade::api::pipeline_subobject_type::any_hit_shader:
+      case reshade::api::pipeline_subobject_type::closest_hit_shader:
+      case reshade::api::pipeline_subobject_type::miss_shader:
+      case reshade::api::pipeline_subobject_type::intersection_shader:
+      case reshade::api::pipeline_subobject_type::callable_shader:      {
+        new_subobjects[i].data = malloc(sizeof(reshade::api::shader_desc));
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::shader_desc));
+        auto* old_desc = static_cast<reshade::api::shader_desc*>(subobject.data);
+        auto* new_desc = static_cast<reshade::api::shader_desc*>(new_subobjects[i].data);
+
+        if (new_desc->entry_point != nullptr && new_desc->entry_point[0] == '\0') {
+          // Reshade guards against nullptr entry points but not empty strings, so we convert as a workaround
+          new_desc->entry_point = nullptr;
+        } else if (new_desc->entry_point != nullptr) {
+          new_desc->entry_point = renodx::utils::CloneCString(new_desc->entry_point);
+        }
+
+#ifdef DEBUG_LEVEL_2
+        {
+          std::stringstream s;
+          s << "utils::pipeline::ClonePipelineSubObjects(entry point";
+          s << " from " << (old_desc->entry_point != nullptr ? old_desc->entry_point : "(null)");
+          s << " to " << (new_desc->entry_point != nullptr ? new_desc->entry_point : "(null)");
+          s << ")";
+          reshade::log::message(reshade::log::level::debug, s.str().c_str());
+        }
+#endif
+
+        if (old_desc->code_size != 0u) {
+          void* code_copy = malloc(old_desc->code_size);
+          memcpy(code_copy, old_desc->code, old_desc->code_size);
+          new_desc->code = code_copy;
+        }
+
+#ifdef DEBUG_LEVEL_1
+        std::stringstream s;
+        s << "utils::pipeline::ClonePipelineSubObjects(cloning ";
+        s << subobject.type;
+        s << " with " << PRINT_CRC32(renodx::utils::hash::ComputeCRC32(static_cast<const uint8_t*>(old_desc->code), old_desc->code_size));
+        s << " => " << PRINT_CRC32(renodx::utils::hash::ComputeCRC32(static_cast<const uint8_t*>(new_desc->code), new_desc->code_size));
+        s << " (" << old_desc->code_size << " bytes)";
+        s << " from " << old_desc->code;
+        s << " to " << new_desc->code;
+        s << ")";
+        reshade::log::message(reshade::log::level::debug, s.str().c_str());
+#endif
+        break;
+      }
+      case reshade::api::pipeline_subobject_type::input_layout:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::input_element) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::input_element) * subobject.count);
+        for (uint32_t j = 0; j < subobject.count; j++) {
+          auto* old_input_elements = static_cast<reshade::api::input_element*>(subobject.data);
+          auto* new_input_elements = static_cast<reshade::api::input_element*>(new_subobjects[i].data);
+          new_input_elements[j].semantic = renodx::utils::CloneCString(old_input_elements[j].semantic);
+        }
+        break;
+      case reshade::api::pipeline_subobject_type::stream_output_state:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::stream_output_desc) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::stream_output_desc) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::blend_state:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::blend_desc) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::blend_desc) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::rasterizer_state:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::rasterizer_desc) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::rasterizer_desc) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::depth_stencil_state:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::depth_stencil_desc) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::depth_stencil_desc) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::primitive_topology:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::primitive_topology) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::primitive_topology) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::depth_stencil_format:
+      case reshade::api::pipeline_subobject_type::render_target_formats:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::format) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::format) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::sample_mask:
+      case reshade::api::pipeline_subobject_type::sample_count:
+      case reshade::api::pipeline_subobject_type::viewport_count:
+      case reshade::api::pipeline_subobject_type::max_vertex_count:
+      case reshade::api::pipeline_subobject_type::max_payload_size:
+      case reshade::api::pipeline_subobject_type::max_attribute_size:
+      case reshade::api::pipeline_subobject_type::max_recursion_depth:
+        new_subobjects[i].data = malloc(sizeof(uint32_t) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(uint32_t) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::dynamic_pipeline_states:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::dynamic_state) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::dynamic_state) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::libraries:
+      case reshade::api::pipeline_subobject_type::shader_groups:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::shader_group) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::shader_group) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::flags:
+        new_subobjects[i].data = malloc(sizeof(reshade::api::pipeline_flags) * subobject.count);
+        memcpy(new_subobjects[i].data, subobject.data, sizeof(reshade::api::pipeline_flags) * subobject.count);
+        break;
+      case reshade::api::pipeline_subobject_type::unknown:
+        break;
+    }
+  }
+
+  return new_subobjects;
+}
+
+static void DestroyPipelineSubobjects(std::span<reshade::api::pipeline_subobject> subobjects) {
+  for (auto& subobject : subobjects) {
+    if (subobject.data == nullptr) continue;
+    switch (subobject.type) {
+      case reshade::api::pipeline_subobject_type::vertex_shader:
+      case reshade::api::pipeline_subobject_type::hull_shader:
+      case reshade::api::pipeline_subobject_type::domain_shader:
+      case reshade::api::pipeline_subobject_type::geometry_shader:
+      case reshade::api::pipeline_subobject_type::compute_shader:
+      case reshade::api::pipeline_subobject_type::pixel_shader:
+      case reshade::api::pipeline_subobject_type::amplification_shader:
+      case reshade::api::pipeline_subobject_type::mesh_shader:
+      case reshade::api::pipeline_subobject_type::raygen_shader:
+      case reshade::api::pipeline_subobject_type::any_hit_shader:
+      case reshade::api::pipeline_subobject_type::closest_hit_shader:
+      case reshade::api::pipeline_subobject_type::miss_shader:
+      case reshade::api::pipeline_subobject_type::intersection_shader:
+      case reshade::api::pipeline_subobject_type::callable_shader:      {
+        auto* desc = static_cast<reshade::api::shader_desc*>(subobject.data);
+        if (desc->entry_point != nullptr) {
+          std::free(const_cast<char*>(desc->entry_point));
+          desc->entry_point = nullptr;
+        }
+        free(const_cast<void*>(desc->code));
+        desc->code = nullptr;
+        break;
+      }
+      case reshade::api::pipeline_subobject_type::input_layout: {
+        auto* input_elements = static_cast<reshade::api::input_element*>(subobject.data);
+        for (uint32_t i = 0; i < subobject.count; ++i) {
+          std::free(const_cast<char*>(input_elements[i].semantic));
+          input_elements[i].semantic = nullptr;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    free(subobject.data);
+    subobject.data = nullptr;
+  }
+}
+
+static void DestroyPipelineSubobjects(reshade::api::pipeline_subobject* subobjects, uint32_t subobject_count) {
+  DestroyPipelineSubobjects({subobjects, subobjects + subobject_count});
+  delete[] subobjects;
+}
+
+static bool HasSDRAlphaBlend(std::span<const reshade::api::pipeline_subobject> subobjects) {
+  for (const auto& subobject : subobjects) {
+    if (subobject.type != reshade::api::pipeline_subobject_type::blend_state) continue;
+    for (uint32_t j = 0; j < subobject.count; ++j) {
+      auto& desc = static_cast<reshade::api::blend_desc*>(subobject.data)[j];
+      if (!desc.blend_enable[0]) continue;
+
+      if (((desc.render_target_write_mask[0] & 0x1) != 0)
+          || ((desc.render_target_write_mask[0] & 0x2) != 0)
+          || ((desc.render_target_write_mask[0] & 0x4) != 0)) {
+        if (desc.color_blend_op[0] != reshade::api::blend_op::min
+            && desc.color_blend_op[0] != reshade::api::blend_op::max) {
+          if (
+              desc.source_color_blend_factor[0] == reshade::api::blend_factor::dest_alpha
+              || desc.source_color_blend_factor[0] == reshade::api::blend_factor::one_minus_dest_alpha
+              || desc.dest_color_blend_factor[0] == reshade::api::blend_factor::dest_alpha
+              || desc.dest_color_blend_factor[0] == reshade::api::blend_factor::one_minus_dest_alpha) {
+            return true;
+          }
+        }
+      }
+      if ((desc.render_target_write_mask[0] & 0x8) != 0) {
+        if (desc.alpha_blend_op[0] == reshade::api::blend_op::min
+            || desc.alpha_blend_op[0] == reshade::api::blend_op::max) {
+          return true;
+        }
+        if (
+            desc.source_alpha_blend_factor[0] == reshade::api::blend_factor::dest_alpha
+            || desc.source_alpha_blend_factor[0] == reshade::api::blend_factor::one_minus_dest_alpha
+            || desc.dest_alpha_blend_factor[0] == reshade::api::blend_factor::one
+            || desc.dest_alpha_blend_factor[0] == reshade::api::blend_factor::dest_alpha
+            || desc.dest_alpha_blend_factor[0] == reshade::api::blend_factor::one_minus_dest_alpha) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+struct PipelineSubobjects {
+  std::span<const uint8_t> vertex_shader;
+  std::span<const uint8_t> pixel_shader;
+  std::span<const uint8_t> compute_shader;
+  std::vector<reshade::api::blend_desc> blend_states = {reshade::api::blend_desc{}};
+  std::vector<reshade::api::input_element> input_layout;
+  std::vector<reshade::api::depth_stencil_desc> depth_stencil_states = {reshade::api::depth_stencil_desc{.depth_enable = false}};
+  std::vector<uint32_t> max_vertex_counts = {3};
+  std::vector<reshade::api::primitive_topology> primitive_topologies = {reshade::api::primitive_topology::triangle_list};
+  std::vector<reshade::api::rasterizer_desc> rasterizer_states = {reshade::api::rasterizer_desc{.cull_mode = reshade::api::cull_mode::none}};
+  std::vector<reshade::api::format> render_target_formats = {reshade::api::format::r16g16b16a16_float};
+};
+
+static reshade::api::pipeline CreateRenderPipeline(
+    reshade::api::device* device,
+    const reshade::api::pipeline_layout layout,
+    PipelineSubobjects& options) {
+  std::vector<reshade::api::pipeline_subobject> subobjects = {
+      {
+          .type = reshade::api::pipeline_subobject_type::blend_state,
+          .count = static_cast<uint32_t>(options.blend_states.size()),
+          .data = options.blend_states.data(),
+      },
+      {
+          .type = reshade::api::pipeline_subobject_type::depth_stencil_state,
+          .count = static_cast<uint32_t>(options.depth_stencil_states.size()),
+          .data = options.depth_stencil_states.data(),
+      },
+      {
+          .type = reshade::api::pipeline_subobject_type::input_layout,
+          .count = static_cast<uint32_t>(options.input_layout.size()),
+          .data = options.input_layout.data(),
+      },
+      {
+          .type = reshade::api::pipeline_subobject_type::max_vertex_count,
+          .count = static_cast<uint32_t>(options.max_vertex_counts.size()),
+          .data = options.max_vertex_counts.data(),
+      },
+      {
+          .type = reshade::api::pipeline_subobject_type::primitive_topology,
+          .count = static_cast<uint32_t>(options.primitive_topologies.size()),
+          .data = options.primitive_topologies.data(),
+      },
+      {
+          .type = reshade::api::pipeline_subobject_type::rasterizer_state,
+          .count = static_cast<uint32_t>(options.rasterizer_states.size()),
+          .data = options.rasterizer_states.data(),
+      },
+
+      {
+          .type = reshade::api::pipeline_subobject_type::render_target_formats,
+          .count = static_cast<uint32_t>(options.render_target_formats.size()),
+          .data = options.render_target_formats.data(),
+      },
+  };
+
+  std::vector<reshade::api::shader_desc> shader_descriptions = {};
+  shader_descriptions.reserve(
+      (options.vertex_shader.empty() ? 0 : 1)
+      + (options.pixel_shader.empty() ? 0 : 1)
+      + (options.compute_shader.empty() ? 0 : 1));
+
+  if (!options.vertex_shader.empty()) {
+    shader_descriptions.push_back({
+        .code = options.vertex_shader.data(),
+        .code_size = options.vertex_shader.size(),
+    });
+    subobjects.push_back({
+        .type = reshade::api::pipeline_subobject_type::vertex_shader,
+        .count = 1,
+        .data = &shader_descriptions.back(),
+    });
+  }
+  if (!options.pixel_shader.empty()) {
+    shader_descriptions.push_back({
+        .code = options.pixel_shader.data(),
+        .code_size = options.pixel_shader.size(),
+    });
+    subobjects.push_back({
+        .type = reshade::api::pipeline_subobject_type::pixel_shader,
+        .count = 1,
+        .data = &shader_descriptions.back(),
+    });
+  }
+  if (!options.compute_shader.empty()) {
+    shader_descriptions.push_back({
+        .code = options.compute_shader.data(),
+        .code_size = options.compute_shader.size(),
+    });
+    subobjects.push_back({
+        .type = reshade::api::pipeline_subobject_type::compute_shader,
+        .count = 1,
+        .data = &shader_descriptions.back(),
+    });
+  }
+
+  reshade::api::pipeline pipeline;
+  if (device->create_pipeline(layout, static_cast<uint32_t>(subobjects.size()), subobjects.data(), &pipeline)) {
+    return pipeline;
+  }
+  return {0};
+}
+
+static reshade::api::pipeline CreateRenderPipeline(
+    reshade::api::device* device,
+    const reshade::api::pipeline_layout layout,
+    const std::unordered_map<reshade::api::pipeline_subobject_type, std::span<const std::uint8_t>>& shaders,
+    const reshade::api::format render_target_format = reshade::api::format::r16g16b16a16_float) {
+  auto format = render_target_format;
+  uint32_t num_vertices = 3;
+  auto topology = reshade::api::primitive_topology::triangle_list;
+  reshade::api::blend_desc blend_state = {};
+  reshade::api::rasterizer_desc rasterizer_state = {.cull_mode = reshade::api::cull_mode::none};
+  reshade::api::depth_stencil_desc depth_stencil_state = {.depth_enable = false};
+  std::vector<reshade::api::input_element> input_layout;
+
+  std::vector<reshade::api::pipeline_subobject> subobjects = {
+      {reshade::api::pipeline_subobject_type::render_target_formats, 1, &format},
+      {reshade::api::pipeline_subobject_type::max_vertex_count, 1, &num_vertices},
+      {reshade::api::pipeline_subobject_type::primitive_topology, 1, &topology},
+      {reshade::api::pipeline_subobject_type::blend_state, 1, &blend_state},
+      {reshade::api::pipeline_subobject_type::rasterizer_state, 1, &rasterizer_state},
+      {reshade::api::pipeline_subobject_type::depth_stencil_state, 1, &depth_stencil_state},
+      {reshade::api::pipeline_subobject_type::input_layout, static_cast<uint32_t>(input_layout.size()), input_layout.data()},
+  };
+
+  subobjects.reserve(6 + shaders.size());
+
+  std::vector<reshade::api::shader_desc> shader_descriptions;
+  shader_descriptions.reserve(shaders.size());
+  for (const auto& [type, shader] : shaders) {
+    shader_descriptions.push_back({
+        .code = shader.data(),
+        .code_size = shader.size(),
+    });
+    subobjects.push_back({.type = type, .count = 1, .data = &shader_descriptions.back()});
+  }
+
+  reshade::api::pipeline pipeline;
+  if (device->create_pipeline(layout, static_cast<uint32_t>(subobjects.size()), subobjects.data(), &pipeline)) {
+    return pipeline;
+  }
+  return {0};
+}
+}  // namespace renodx::utils::pipeline
