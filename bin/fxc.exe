@@ -1,0 +1,5 @@
+#!/bin/sh
+# wine 版 fxc 替身: 原生 d3dcompiler_47 编译 SM5 DXBC
+export WINEPREFIX="$HOME/tools/wineprefix"
+export WINEDLLOVERRIDES="d3dcompiler_47=n"
+exec wine "$HOME/tools/shaderbin/fxc_wrap.exe" "$@"
