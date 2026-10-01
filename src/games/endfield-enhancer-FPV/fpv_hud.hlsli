@@ -1,4 +1,6 @@
 // FPV HUD共享绘制库: DX11(cbuffer b13)与Vulkan(push constant)两份入口共用
+// 独立叠加 pass 用: 传入的 base 恒为全透明, 函数返回的是 HUD 颜色与覆盖率(alpha),
+// 与画面的合成交给硬件混合完成, 因此不读回任何画面内容。
 // payload布局与C++侧 endfield::fpv_swapchain::FpvHudPayload.v[16] 一一对应:
 //   v[0],v[1],v[6],v[7] = HDR输出契约哨兵(1,1,4,1), hdr_output.hpp ReadOutputContract
 //                         会拿这四个值做校验, 任何一侧都不可改写
@@ -36,7 +38,7 @@ float4 DrawFpvHud(float2 pix, float4 base, FpvHudData d) {
     float dc = length(pix - center);
     float ring = hud_falloff(abs(dc - 16.0), 2.0);
     float dotc = 1.0 - smoothstep(1.2, 2.4, dc);
-    base.rgb = lerp(base.rgb, white, saturate(ring * 0.7 + dotc * 0.9));
+    base = lerp(base, float4(white, 1.0), saturate(ring * 0.7 + dotc * 0.9));
   }
 
   // 人工地平线: 过中心的直线, 随roll旋转, 随pitch上下偏移, 中段留缺口
@@ -52,7 +54,7 @@ float4 DrawFpvHud(float2 pix, float4 base, FpvHudData d) {
     float gap = step(16.0, abs(along));
     float span = step(abs(along), 160.0);
     float horizon = hud_falloff(dist_line, 2.4) * gap * span;
-    base.rgb = lerp(base.rgb, red, horizon * 0.75);
+    base = lerp(base, float4(red, 1.0), horizon * 0.75);
   }
 
   // 摇杆双pad: 左=偏航/油门(琥珀), 右=横滚/俯仰(青)
@@ -81,14 +83,14 @@ float4 DrawFpvHud(float2 pix, float4 base, FpvHudData d) {
       // 边框
       const float2 dv = max(dpad - pad * 0.5, 0.0);
       const float border = hud_falloff(length(dv), 1.5);
-      base.rgb = lerp(base.rgb, white, border * 0.55);
+      base = lerp(base, float4(white, 1.0), border * 0.55);
       // 十字线
       const float cross = (hud_falloff(dpad.y, 0.8) + hud_falloff(dpad.x, 0.8)) * in_pad;
-      base.rgb = lerp(base.rgb, white, saturate(cross) * 0.35);
+      base = lerp(base, float4(white, 1.0), saturate(cross) * 0.35);
       // 杆量圆点: 行程与半径按边长缩放
       const float2 dot_pos = c + float2(sticks[i].x, -sticks[i].y) * (pad * 0.5 - dot_radius);
       const float dd = length(pix - dot_pos);
-      base.rgb = lerp(base.rgb, cols[i], 1.0 - smoothstep(dot_radius * 0.6, dot_radius, dd));
+      base = lerp(base, float4(cols[i], 1.0), 1.0 - smoothstep(dot_radius * 0.6, dot_radius, dd));
     }
   }
   return base;

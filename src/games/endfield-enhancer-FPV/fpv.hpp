@@ -23,6 +23,8 @@
 
 #include <include/reshade.hpp>
 
+#include "./config_store.hpp"
+
 // camera_math.hpp 只提供了加法和标量乘, 本模块自备减法
 inline Vec3 Sub(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 
@@ -375,54 +377,53 @@ inline wchar_t device_name[128] = L"";
 
 // ---- 标定与映射的配置持久化 ----
 // section 由调用方传入(与 renodx settings 用的段名一致, 否则会和设置项分家)
-inline std::string config_section;      // 记下段名, 供后台线程保存用
 inline std::atomic_bool cal_loaded{false};  // 已从配置读过标定, Poll 就不要再填默认值
 
-inline void SaveToConfig(const char* section) {
-  if (section == nullptr || *section == '\0') return;
-  config_section = section;
+inline void SaveToConfig() {
+  using endfield::config_store::SetFloat;
+  using endfield::config_store::SetInt;
   char key[32];
   for (int i = 0; i < 8; ++i) {
-    std::snprintf(key, sizeof(key), "FPVCal%dLo", i);
-    reshade::set_config_value(nullptr, section, key, cal[i][0]);
-    std::snprintf(key, sizeof(key), "FPVCal%dMid", i);
-    reshade::set_config_value(nullptr, section, key, cal[i][1]);
-    std::snprintf(key, sizeof(key), "FPVCal%dHi", i);
-    reshade::set_config_value(nullptr, section, key, cal[i][2]);
+    std::snprintf(key, sizeof(key), "Cal%dLo", i);
+    SetFloat("FPV", key, cal[i][0]);
+    std::snprintf(key, sizeof(key), "Cal%dMid", i);
+    SetFloat("FPV", key, cal[i][1]);
+    std::snprintf(key, sizeof(key), "Cal%dHi", i);
+    SetFloat("FPV", key, cal[i][2]);
   }
-  reshade::set_config_value(nullptr, section, "FPVDeviceId", device_id);
-  reshade::set_config_value(nullptr, section, "FPVAxisRoll", axis_roll);
-  reshade::set_config_value(nullptr, section, "FPVAxisPitch", axis_pitch);
-  reshade::set_config_value(nullptr, section, "FPVAxisYaw", axis_yaw);
-  reshade::set_config_value(nullptr, section, "FPVAxisThrottle", axis_throttle);
-  reshade::set_config_value(nullptr, section, "FPVInvertPitch", invert_pitch);
-  reshade::set_config_value(nullptr, section, "FPVInvertRoll", invert_roll);
-  reshade::set_config_value(nullptr, section, "FPVInvertYaw", invert_yaw);
-  reshade::set_config_value(nullptr, section, "FPVInvertThrottle", invert_throttle);
+  SetInt("FPV", "DeviceId", device_id);
+  SetInt("FPV", "AxisRoll", axis_roll);
+  SetInt("FPV", "AxisPitch", axis_pitch);
+  SetInt("FPV", "AxisYaw", axis_yaw);
+  SetInt("FPV", "AxisThrottle", axis_throttle);
+  SetInt("FPV", "InvertPitch", invert_pitch);
+  SetInt("FPV", "InvertRoll", invert_roll);
+  SetInt("FPV", "InvertYaw", invert_yaw);
+  SetInt("FPV", "InvertThrottle", invert_throttle);
 }
 
-inline void LoadFromConfig(const char* section) {
-  if (section == nullptr || *section == '\0') return;
-  config_section = section;
+inline void LoadFromConfig() {
+  using endfield::config_store::GetFloat;
+  using endfield::config_store::GetInt;
   char key[32];
   for (int i = 0; i < 8; ++i) {
-    std::snprintf(key, sizeof(key), "FPVCal%dLo", i);
-    reshade::get_config_value(nullptr, section, key, cal[i][0]);
-    std::snprintf(key, sizeof(key), "FPVCal%dMid", i);
-    reshade::get_config_value(nullptr, section, key, cal[i][1]);
-    std::snprintf(key, sizeof(key), "FPVCal%dHi", i);
-    reshade::get_config_value(nullptr, section, key, cal[i][2]);
+    std::snprintf(key, sizeof(key), "Cal%dLo", i);
+    GetFloat("FPV", key, cal[i][0]);
+    std::snprintf(key, sizeof(key), "Cal%dMid", i);
+    GetFloat("FPV", key, cal[i][1]);
+    std::snprintf(key, sizeof(key), "Cal%dHi", i);
+    GetFloat("FPV", key, cal[i][2]);
   }
-  reshade::get_config_value(nullptr, section, "FPVDeviceId", device_id);
-  reshade::get_config_value(nullptr, section, "FPVAxisRoll", axis_roll);
-  reshade::get_config_value(nullptr, section, "FPVAxisPitch", axis_pitch);
-  reshade::get_config_value(nullptr, section, "FPVAxisYaw", axis_yaw);
-  reshade::get_config_value(nullptr, section, "FPVAxisThrottle", axis_throttle);
-  reshade::get_config_value(nullptr, section, "FPVInvertPitch", invert_pitch);
-  reshade::get_config_value(nullptr, section, "FPVInvertRoll", invert_roll);
-  reshade::get_config_value(nullptr, section, "FPVInvertYaw", invert_yaw);
-  reshade::get_config_value(nullptr, section, "FPVInvertThrottle", invert_throttle);
-  // 夹一下, 免得ini里被写进离谱的值
+  GetInt("FPV", "DeviceId", device_id);
+  GetInt("FPV", "AxisRoll", axis_roll);
+  GetInt("FPV", "AxisPitch", axis_pitch);
+  GetInt("FPV", "AxisYaw", axis_yaw);
+  GetInt("FPV", "AxisThrottle", axis_throttle);
+  GetInt("FPV", "InvertPitch", invert_pitch);
+  GetInt("FPV", "InvertRoll", invert_roll);
+  GetInt("FPV", "InvertYaw", invert_yaw);
+  GetInt("FPV", "InvertThrottle", invert_throttle);
+  // 夹一下, 免得配置文件被写坏之后数值飞掉
   axis_roll = std::clamp(axis_roll, 0, 7);
   axis_pitch = std::clamp(axis_pitch, 0, 7);
   axis_yaw = std::clamp(axis_yaw, 0, 7);
@@ -455,7 +456,7 @@ inline void Poll() {
     if (cal_travel.load(std::memory_order_relaxed)
         && GetTickCount64() > travel_until.load(std::memory_order_relaxed)) {
       cal_travel.store(false, std::memory_order_relaxed);
-      if (!config_section.empty()) SaveToConfig(config_section.c_str());  // 行程校准结果落盘
+      SaveToConfig();  // 行程校准结果落到内存表, 由主线程节流落盘
     }
     DIJOYSTATE2 js{};
     const bool via_di = di::ready.load(std::memory_order_relaxed) && di::Read(&js);

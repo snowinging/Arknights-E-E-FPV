@@ -14,6 +14,8 @@
 #include "../../utils/settings.hpp"
 #include "../../utils/swapchain.hpp"
 #include "./enhancer.hpp"
+#include "./config_store.hpp"
+#include "./fpv_hud_pass.hpp"
 #include "./uncensor.hpp"
 #include "./lod.hpp"
 #include "./npc_distance.hpp"
@@ -73,13 +75,16 @@ bool OnCreateDevice(reshade::api::device_api api, uint32_t&) {
 }
 
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool) {
+  // 在这里把 HUD 叠加 pass 的 pipeline 与 back buffer 视图建好(不在 present 里创建对象)
+  endfield::fpv_hud_pass::OnInitSwapchain(swapchain);
   endfield::lod::OnRendererReset();
   endfield::enhancer::TryInstallStreamlineHook(swapchain->get_device());
   limiter_resume_delay.store(
       kLimiterResumeDelayFrames, std::memory_order_relaxed);
 }
 
-void OnDestroySwapchain(reshade::api::swapchain*, bool) {
+void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
+  endfield::fpv_hud_pass::OnSwapchainReset(swapchain->get_device());
   endfield::lod::OnRendererReset();
   limiter_resume_delay.store(
       kLimiterResumeDelayFrames, std::memory_order_relaxed);
@@ -620,6 +625,16 @@ renodx::utils::settings::Settings settings = {
         .format = "%.0f°",
     },
     new renodx::utils::settings::Setting{
+        .key = "FPVHudPass",
+        .binding = &endfield::fpv_hud_pass::enabled,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "HUD 叠加通道",
+        .section = "FPV 穿越机",
+        .tooltip = "着色器HUD专用的叠加pass。画面异常时可临时关掉它来排查。",
+        .labels = {"Off", "On"},
+    },
+    new renodx::utils::settings::Setting{
         .key = "FPVHudCrosshair",
         .binding = &endfield::camera::detail::fpv::hud_crosshair,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -760,6 +775,7 @@ renodx::utils::settings::Settings settings = {
           static const char* device_items[] = {"自动", "ID 0", "ID 1", "ID 2", "ID 3", "ID 4", "ID 5", "ID 6", "ID 7",
                                                "ID 8", "ID 9", "ID 10", "ID 11", "ID 12", "ID 13", "ID 14", "ID 15"};
           int device_index = fpv::device_id + 1;
+          ImGui::SetNextItemWidth(140.f);
           if (ImGui::Combo("设备选择", &device_index, device_items, 17)) {
             fpv::device_id = device_index - 1;
             dirty = true;
@@ -784,6 +800,8 @@ renodx::utils::settings::Settings settings = {
                       fpv::radio::vis_yaw.load(), fpv::radio::vis_thr.load());
           auto axis_combo = [axis_names, axis_count](const char* label, int* axis) {
             bool changed = false;
+            // 一行要放两个, 不限制宽度的话每个都会去抢满剩余宽度, 后面那个就被挤出可视区
+            ImGui::SetNextItemWidth(96.f);
             if (ImGui::BeginCombo(label, axis_names[*axis])) {
               for (int i = 0; i < axis_count; ++i)
                 if (ImGui::Selectable(axis_names[i], i == *axis)) {
@@ -855,10 +873,7 @@ renodx::utils::settings::Settings settings = {
             cal_edit("油门", fpv::axis_throttle);
             ImGui::TextDisabled("输入后按回车生效; 原始行可对照当前轴名。");
           }
-          if (dirty) {
-            // 段名要和 renodx 设置系统用的一致, 否则标定会和其它设置分家
-            fpv::radio::SaveToConfig((renodx::utils::settings::global_name + "-preset1").c_str());
-          }
+          if (dirty) fpv::radio::SaveToConfig();
           return false;
         },
     },
@@ -1902,6 +1917,67 @@ renodx::utils::settings::Settings settings = {
     },
 };
 
+// 把自有配置灌进 ReShade 的 ini 缓存。
+// 这一步必须抢在 renodx 的设置系统之前: 它的 Use() 会按段名从 ReShade.ini 读一整套值,
+// ReShade.ini 里如果还留着旧配置, 我们存下来的就会被顶掉。先灌进缓存, 它读到的就是我们的。
+static void PushStoreIntoReshadeConfig() {
+  const std::string section = renodx::utils::settings::global_name + "-preset1";
+  uint32_t pushed = 0;
+  for (auto* setting : settings) {
+    if (setting == nullptr || setting->key.empty()) continue;
+    float value = 0.f;
+    if (!endfield::config_store::GetFloat("Settings", setting->key.c_str(), value)) continue;
+    reshade::set_config_value(nullptr, section.c_str(), setting->key.c_str(), value);
+    ++pushed;
+  }
+  char report[144];
+  std::snprintf(report, sizeof(report), "E_E_FPV: pushed %u settings into ReShade config cache", pushed);
+  reshade::log::message(reshade::log::level::info, report);
+}
+
+// 把 AEEF.ini 里的值套回所有设置项(在 ReShade 的 LoadSettings 之后调用, 以我们的为准)
+static void ApplySettingsFromStore() {
+  namespace settings_ns = renodx::utils::settings;
+  if (settings_ns::settings == nullptr) return;
+  uint32_t applied = 0;
+  for (auto* setting : *settings_ns::settings) {
+    if (setting == nullptr || setting->key.empty()) continue;
+    float value = 0.f;
+    if (!endfield::config_store::GetFloat("Settings", setting->key.c_str(), value)) continue;
+    setting->Set(value)->Write();
+    ++applied;
+  }
+  char report[128];
+  std::snprintf(report, sizeof(report), "E_E_FPV: restored %u settings from config store", applied);
+  reshade::log::message(reshade::log::level::info, report);
+}
+
+// 面板里改了值就往配置存储里同步, 攒够两秒落一次盘(拖动滑条时不会每帧写文件)
+static void SyncSettingsToStore() {
+  namespace settings_ns = renodx::utils::settings;
+  if (settings_ns::settings != nullptr) {
+    static std::unordered_map<std::string, float> snapshot;
+    for (auto* setting : *settings_ns::settings) {
+      if (setting == nullptr || setting->key.empty()) continue;
+      const float value = setting->GetValue();
+      const auto found = snapshot.find(setting->key);
+      if (found != snapshot.end() && found->second == value) continue;
+      snapshot[setting->key] = value;
+      endfield::config_store::SetFloat("Settings", setting->key.c_str(), value);
+    }
+  }
+
+  static ULONGLONG last_save = 0;
+  static bool pending = false;
+  if (endfield::config_store::dirty) pending = true;
+  const ULONGLONG now = GetTickCount64();
+  if (!pending || now - last_save < 2000) return;
+  last_save = now;
+  pending = false;
+  endfield::config_store::dirty = false;
+  endfield::config_store::Save();
+}
+
 void OnOverlay(reshade::api::effect_runtime* runtime) {
   overlay_device = runtime->get_device();
 
@@ -1914,11 +1990,45 @@ void OnOverlay(reshade::api::effect_runtime* runtime) {
   ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase);
   endfield::menu::Draw(settings);
   ImGui::PopFont();
+
+  // 面板窗口的位置与大小需要自己存:
+  // ReShade 在 runtime_gui.cpp 里把 ImGui 的 IniFilename 置空, 禁用了 ImGui 自带的布局
+  // 持久化; 而窗口本身是它用 ImGui::Begin(标题) 开的, 所以没人负责保存 —— 表现就是每次
+  // 启动窗口都回到默认位置, 拖动和缩放留不下来。这里借 ReShade 的配置接口自己存一份。
+  {
+    static bool restored = false;
+    if (!restored) {
+      restored = true;
+      float x = 0.f, y = 0.f, w = 0.f, h = 0.f;
+      if (endfield::config_store::GetFloat("Window", "X", x)
+          && endfield::config_store::GetFloat("Window", "Y", y)) {
+        ImGui::SetWindowPos(ImVec2(x, y), ImGuiCond_Always);
+      }
+      if (endfield::config_store::GetFloat("Window", "W", w)
+          && endfield::config_store::GetFloat("Window", "H", h)) {
+        ImGui::SetWindowSize(ImVec2(w, h), ImGuiCond_Always);
+      }
+    }
+
+    const ImVec2 position = ImGui::GetWindowPos();
+    const ImVec2 size = ImGui::GetWindowSize();
+    static ImVec2 last_position(-1.f, -1.f), last_size(-1.f, -1.f);
+    if (position.x != last_position.x || position.y != last_position.y
+        || size.x != last_size.x || size.y != last_size.y) {
+      last_position = position;
+      last_size = size;
+      // 只写内存, 落盘交给 SyncSettingsToStore 的节流逻辑
+      endfield::config_store::SetFloat("Window", "X", position.x);
+      endfield::config_store::SetFloat("Window", "Y", position.y);
+      endfield::config_store::SetFloat("Window", "W", size.x);
+      endfield::config_store::SetFloat("Window", "H", size.y);
+    }
+  }
   overlay_device = nullptr;
 }
 
 void OnPresent(
-    reshade::api::command_queue*,
+    reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
     const reshade::api::rect*,
     const reshade::api::rect*,
@@ -1962,6 +2072,17 @@ void OnPresent(
           && swapchain != nullptr
           && HasSsrBaseAddon(swapchain->get_device()->get_api()));
   endfield::hdr_output::OnPresent(swapchain);
+  endfield::fpv_hud_pass::Render(queue, swapchain);  // 画在 ReShade 的 ImGui 之前
+  // 顺序要紧: 先套用自有配置, 再同步回文件。
+  // 反过来的话, 同步会把 ReShade.ini 里可能存在的旧值写进 AEEF.ini, 等于自己污染自己。
+  {
+    static bool reapplied = false;
+    if (!reapplied) {
+      reapplied = true;
+      ApplySettingsFromStore();  // 兜底: 游戏跑起来后再套一次, 防止加载途中有环节读回 ReShade.ini
+    }
+  }
+  SyncSettingsToStore();
   endfield::lod::OnPresent();
   endfield::npc_distance::OnPresent();
   endfield::npc_offcamera::OnPresent();
@@ -2005,15 +2126,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD reason, LPVOID) {
       if (!reshade::register_addon(h_module)) return FALSE;
       // [FPV] 设置写入前缀: 配置落在 [AEEF-preset1] 段(改了段名等于换了一份配置)
       renodx::utils::settings::global_name = "AEEF";
-      // FPV HUD: 按API注册代理着色器blob + 激活v2交换链代理与注入payload
-      renodx::mods::swapchain::v2::swap_chain_proxy_shaders[reshade::api::device_api::d3d11] = {
-          .vertex_shader = std::span<const std::uint8_t>(__0xF01D0001_base, sizeof(__0xF01D0001_base)),
-          .pixel_shader = std::span<const std::uint8_t>(__0xF01D0002_base, sizeof(__0xF01D0002_base))};
-      renodx::mods::swapchain::v2::swap_chain_proxy_shaders[reshade::api::device_api::vulkan] = {
-          .vertex_shader = std::span<const std::uint8_t>(__0xF01D0003_base, sizeof(__0xF01D0003_base)),
-          .pixel_shader = std::span<const std::uint8_t>(__0xF01D0004_base, sizeof(__0xF01D0004_base))};
-      renodx::utils::resource::upgrade::use_resource_cloning = true;
-      renodx::mods::swapchain::v2::Use(reason, &endfield::fpv_swapchain::hud_payload);
+      // FPV HUD: 用独立叠加 pass 画, 不再占用 swapchain v2 的代理通道。
+      // 那条通道原本是给 HDR 输出用的: 注册进去会顶掉它的 pixel shader, 而整条链还要求
+      // 把交换链升级成 fp16, 结果游戏的色彩空间转换被挖掉(Windows 上表现为整屏偏色)。
+      endfield::fpv_hud_pass::SetPayload(endfield::fpv_swapchain::hud_payload.v,
+                                         std::size(endfield::fpv_swapchain::hud_payload.v));
       renodx::utils::settings::use_presets = false;
       renodx::utils::settings::overlay_title = "E_E_FPV";
       reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
@@ -2028,6 +2145,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::init_command_list>(endfield::screenshots::observer::OnInitCommandList);
       reshade::register_event<reshade::addon_event::init_command_queue>(endfield::screenshots::observer::OnInitQueue);
       reshade::register_event<reshade::addon_event::destroy_device>(endfield::screenshots::observer::OnDestroyDevice);
+      reshade::register_event<reshade::addon_event::destroy_device>(endfield::fpv_hud_pass::DestroyDevice);
       break;
     case DLL_PROCESS_DETACH:
       endfield::window_enhancements::request_window_enhancements_shutdown();
@@ -2037,6 +2155,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD reason, LPVOID) {
       reshade::unregister_event<reshade::addon_event::init_command_list>(endfield::screenshots::observer::OnInitCommandList);
       reshade::unregister_event<reshade::addon_event::init_command_queue>(endfield::screenshots::observer::OnInitQueue);
       reshade::unregister_event<reshade::addon_event::destroy_device>(endfield::screenshots::observer::OnDestroyDevice);
+      reshade::unregister_event<reshade::addon_event::destroy_device>(endfield::fpv_hud_pass::DestroyDevice);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(
           OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(
@@ -2065,6 +2184,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_DETACH) {
     reshade::unregister_overlay(renodx::utils::settings::overlay_title.c_str(), OnOverlay);
   }
+  // 自有配置文件必须在 ReShade 的设置系统读取之前到位, 否则会被 ReShade.ini 里的旧值覆盖
+  if (reason == DLL_PROCESS_ATTACH) {
+    endfield::config_store::Load(h_module);
+    PushStoreIntoReshadeConfig();
+  }
   renodx::utils::settings::Use(reason, &settings);
   if (reason == DLL_PROCESS_ATTACH) {
     endfield::ssr_resolve::Use(reason);
@@ -2079,9 +2203,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD reason, LPVOID) {
         renodx::utils::settings::overlay_title.c_str(),
         renodx::utils::settings::OnRegisterOverlay);
     reshade::register_overlay(renodx::utils::settings::overlay_title.c_str(), OnOverlay);
+    ApplySettingsFromStore();
     // 遥控器标定/轴映射在设置系统起来之后立刻读回来(轮询线程是懒启动的, 这里一定更早)
-    endfield::camera::detail::fpv::radio::LoadFromConfig(
-        (renodx::utils::settings::global_name + "-preset1").c_str());
+    endfield::camera::detail::fpv::radio::LoadFromConfig();
   }
   renodx::utils::swapchain::Use(reason);
 
