@@ -1,0 +1,15 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "endfield-enhancer-fpv",
+  "title": "Arknights: Endfield Enhancer FPV",
+  "summary": "魔改版本的RenoDX: Arknights Endfield Enhancer，在原mod基础上提供了FPV模拟器的体验",
+  "status": "experimental",
+  "deploy": {
+    "game_exe": "Endfield.exe",
+    "process_name": "Endfield",
+    "api": "vulkan",
+    "architecture": [
+      "x64"
+    ]
+  }
+}
