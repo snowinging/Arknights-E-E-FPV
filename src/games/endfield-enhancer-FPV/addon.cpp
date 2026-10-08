@@ -92,10 +92,6 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
 
 void OnInitDevice(reshade::api::device* device) {
   endfield::screenshots::observer::OnInitDevice(device);
-  // 与 enhancer 自身钩子同时机安装(ACE 对该时机的进程内修改是容忍的), 避开启动扫描
-  endfield::camera::detail::fpv::stealth::Install();
-  endfield::camera::detail::fpv::stealth::StripExistingGamepadRegistrations();
-
   if (device != nullptr
       && (device->get_api() == reshade::api::device_api::vulkan
           || device->get_api() == reshade::api::device_api::d3d11)) {
@@ -484,9 +480,9 @@ renodx::utils::settings::Settings settings = {
         .binding = &endfield::camera::detail::fpv::anchor_enabled,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
         .default_value = 0.f,
-        .label = "锚点迁移 (实验)",
+        .label = "光照体积跟随相机",
         .section = "FPV 穿越机",
-        .tooltip = "调用引擎 SetOverrideStreamingCenterByCamera, 让流式加载/LOD中心跟随FPV相机。开启后飞远处世界会实时对焦, 关闭不会立刻撤销已设置的覆盖。",
+        .tooltip = "光照体积跟着相机加载。不改地形和物件 LOD, 关 FPV 时自动撤销。",
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
@@ -831,9 +827,14 @@ renodx::utils::settings::Settings settings = {
             dirty = true;
           }
           ImGui::SameLine();
-          if (fpv::radio::cal_travel.load())
-            ImGui::Text("行程校准中... 把所有摇杆推满一圈!");
-          else if (ImGui::Button("校准行程 (5秒)")) fpv::radio::StartTravelCalibration();
+          if (fpv::radio::cal_travel.load()) {
+            ImGui::Text("行程校准中... 剩余 %.1fs, 把所有摇杆推满一圈!", fpv::radio::TravelCalibrationLeft());
+            ImGui::Text("本轮扫到: 横滚[%.0f..%.0f] 俯仰[%.0f..%.0f] 偏航[%.0f..%.0f] 油门[%.0f..%.0f]",
+                        fpv::radio::cal_scan_lo[fpv::axis_roll], fpv::radio::cal_scan_hi[fpv::axis_roll],
+                        fpv::radio::cal_scan_lo[fpv::axis_pitch], fpv::radio::cal_scan_hi[fpv::axis_pitch],
+                        fpv::radio::cal_scan_lo[fpv::axis_yaw], fpv::radio::cal_scan_hi[fpv::axis_yaw],
+                        fpv::radio::cal_scan_lo[fpv::axis_throttle], fpv::radio::cal_scan_hi[fpv::axis_throttle]);
+          } else if (ImGui::Button("校准行程 (5秒)")) fpv::radio::StartTravelCalibration();
           ImGui::SameLine();
           if (ImGui::Button("重置标定")) {
             for (int i = 0; i < 8; ++i) {
@@ -2034,6 +2035,11 @@ void OnPresent(
     const reshade::api::rect*,
     uint32_t,
     const reshade::api::rect*) {
+  // 锚点迁移: 每帧看一次实际武装状态, 关 FPV / 关自由相机 / 拧回 Off 都会把流送中心覆盖撤掉
+  endfield::camera::detail::fpv::anchor::Poll(
+      endfield::camera::detail::fpv::anchor_enabled >= .5f
+      && endfield::camera::detail::fpv::requested.load(std::memory_order_relaxed)
+      && endfield::camera::detail::freecam::requested.load(std::memory_order_relaxed));
   // HUD遥测: 分辨率填充
   if (swapchain != nullptr) {
     const auto bb = swapchain->get_current_back_buffer();
@@ -2043,11 +2049,6 @@ void OnPresent(
       v[2] = static_cast<float>(desc.texture.width);
       v[3] = static_cast<float>(desc.texture.height);
     }
-  }
-  static unsigned stealth_attempts = 0;
-  if (stealth_attempts < 600 && !endfield::camera::detail::fpv::stealth::complete.load(std::memory_order_relaxed)) {
-    endfield::camera::detail::fpv::stealth::Install();
-    ++stealth_attempts;
   }
   HWND window = swapchain == nullptr
                     ? nullptr

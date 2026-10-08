@@ -206,6 +206,8 @@ inline void HookedPush(void* brain, void* state, MethodInfo* method) {
   void* manager = nullptr;
   void* controller = Context(v, &manager);
   freecam::Maintain();
+  // 锚点迁移的复位必须回到游戏线程做(这里就是), 不能留在 OnPresent 的渲染线程里
+  endfield::camera::detail::fpv::anchor::ConsumeReset();
   if (!controller) {
     void* pending = manager ? Invoke(controller_method, manager) : nullptr;
     if (!pending || object_class(pending) != dialogue::controller_class

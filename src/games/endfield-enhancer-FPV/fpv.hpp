@@ -18,8 +18,6 @@
 #include <windows.h>
 #include <joystickapi.h>
 #include <dinput.h>
-#include <hidsdi.h>
-#include <hidpi.h>
 
 #include <include/reshade.hpp>
 
@@ -145,208 +143,8 @@ inline float AxisNorm(const DIJOYSTATE2& js, int ax) {
 } // namespace di
 
 // ---- 遥控器轮询线程 ----
-// ---- 隐身层: IAT 导入表钩子, 让游戏看不到手柄 ----
-// 只替换调用模块导入表里的函数指针(原子写), 不改函数体, 无在线补丁竞态。
-// 我们自己模块的导入表不动, 轮询线程直接调真函数。
-namespace stealth {
-inline std::atomic_bool installed{false};
-using pfnGetProcAddress = FARPROC(WINAPI*)(HMODULE, LPCSTR);
-inline pfnGetProcAddress orig_gpa = nullptr;
-inline std::atomic_int hooked_count{0};
-inline std::atomic_bool complete{false};   // GameAssembly 也已挂钩
-inline std::atomic_bool armed{true};    // 遥控器当不了手柄, 进程内全程隐身
-inline std::vector<std::pair<void**, void*>> restored;  // (IAT槽位, 原函数)
-
-static UINT WINAPI StubJoyNumDevs() { return armed.load(std::memory_order_relaxed) ? 0u : joyGetNumDevs(); }
-static MMRESULT WINAPI StubJoyPosEx(UINT id, JOYINFOEX* info) {
-  return armed.load(std::memory_order_relaxed) ? JOYERR_PARMS : joyGetPosEx(id, info);
-}
-static MMRESULT WINAPI StubJoyCaps(UINT id, JOYCAPSW* caps, UINT size) {
-  return armed.load(std::memory_order_relaxed) ? MMSYSERR_BADDEVICEID : joyGetDevCapsW(id, caps, size);
-}
-using pfnRawInputDeviceInfoList = UINT(WINAPI*)(RAWINPUTDEVICELIST*, UINT*, UINT);
-static DWORD WINAPI StubXInputGetState(DWORD, void*) { return 1163; }  // ERROR_DEVICE_NOT_CONNECTED
-using pfnHidPGetCaps = NTSTATUS(WINAPI*)(void*, HIDP_CAPS*);
-inline pfnHidPGetCaps orig_hidp_getcaps = nullptr;
-// 谎报 HID 用途页: 输入系统无法把设备归类为手柄/摇杆
-static NTSTATUS WINAPI StubHidPGetCaps(void* preparsed, HIDP_CAPS* caps) {
-  const NTSTATUS status = orig_hidp_getcaps(preparsed, caps);
-  static std::atomic_uint logs{0};
-  if (caps && status >= 0 && logs.fetch_add(1, std::memory_order_relaxed) < 12) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "E_E_FPV stealth: HidP_GetCaps usage=%u/%u -> %s",
-             caps->UsagePage, caps->Usage,
-             armed.load(std::memory_order_relaxed) ? "lied(0/0)" : "passthrough");
-    Log(reshade::log::level::info, buf);
-  }
-  if (armed.load(std::memory_order_relaxed) && caps && status >= 0) {
-    caps->Usage = 0;
-    caps->UsagePage = 0;
-  }
-  return status;
-}
-using pfnRawInputDeviceInfoW = UINT(WINAPI*)(void*, UINT, void*, UINT*);
-inline pfnRawInputDeviceInfoW orig_ridiw = nullptr;
-// 原始输入设备信息里的用途同样谎报, 堵住 GetRawInputDeviceInfoW 分类通路
-static UINT WINAPI StubRawInputDeviceInfoW(void* handle, UINT cmd, void* data, UINT* size) {
-  const UINT result = orig_ridiw(handle, cmd, data, size);
-  if (armed.load(std::memory_order_relaxed) && data && cmd == 0x20000007 /*RIDI_DEVICEINFO*/) {
-    auto* info = static_cast<RID_DEVICE_INFO*>(data);
-    if (info->dwType == RIM_TYPEHID && (info->hid.usUsage == 4 || info->hid.usUsage == 5)) {
-      info->hid.usUsagePage = 0;
-      info->hid.usUsage = 0;
-    }
-  }
-  return result;
-}
-static UINT WINAPI StubRawInputDeviceList(RAWINPUTDEVICELIST* list, UINT* count, UINT size) {
-  static pfnRawInputDeviceInfoList real = nullptr;
-  if (!real) real = reinterpret_cast<pfnRawInputDeviceInfoList>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetRawInputDeviceList"));
-  const UINT result = real ? real(list, count, size) : 0;
-  static std::atomic_uint logs{0};
-  if (logs.fetch_add(1, std::memory_order_relaxed) < 3) {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "E_E_FPV stealth: RawInputDeviceList real=%u -> armed lied 0", result);
-    Log(reshade::log::level::info, buf);
-  }
-  return armed.load(std::memory_order_relaxed) ? 0u : result;
-}
-static DWORD WINAPI StubXInputGetCapabilities(DWORD, DWORD, void*) { return 1163; }
-static BOOL WINAPI StubRegisterRID(const RAWINPUTDEVICE* devices, UINT count, UINT size) {
-  if (!armed.load(std::memory_order_relaxed) || !devices || !count)
-    return RegisterRawInputDevices(devices, count, size);
-  RAWINPUTDEVICE filtered[8]{};
-  UINT kept = 0;
-  for (UINT i = 0; i < count && kept < 8; ++i) {
-    const bool gamepad = devices[i].usUsagePage == 1 && (devices[i].usUsage == 4 || devices[i].usUsage == 5);
-    const bool removing = (devices[i].dwFlags & RIDEV_REMOVE) != 0;
-    if (gamepad && !removing) continue;  // 武装状态下吞掉摇杆/手柄注册
-    filtered[kept++] = devices[i];
-  }
-  if (!kept) return TRUE;
-  static std::atomic_uint logs{0};
-  if (logs.fetch_add(1, std::memory_order_relaxed) < 5) {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "E_E_FPV stealth: RegisterRID kept %u/%u", kept, count);
-    Log(reshade::log::level::info, buf);
-  }
-  return RegisterRawInputDevices(filtered, kept, size);
-}
-
-static void** FindImportAddress(HMODULE mod, const char* dll, const char* func) {
-  const auto base = reinterpret_cast<uint8_t*>(mod);
-  const auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-  if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-  const auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return nullptr;
-  const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-  if (!dir.VirtualAddress) return nullptr;
-  auto import = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
-  for (; import->Name; ++import) {
-    const char* name = reinterpret_cast<const char*>(base + import->Name);
-    if (_stricmp(name, dll) != 0) continue;
-    auto thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + import->OriginalFirstThunk);
-    auto slot = reinterpret_cast<void**>(base + import->FirstThunk);
-    for (; thunk->u1.Function; ++thunk, ++slot) {
-      if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
-      const auto by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + thunk->u1.AddressOfData);
-      if (strcmp(by_name->Name, func) == 0) return slot;
-    }
-  }
-  return nullptr;
-}
-
-static bool PatchImport(HMODULE mod, const char* mod_name, const char* dll, const char* func, void* stub) {
-  void** slot = FindImportAddress(mod, dll, func);
-  if (!slot || *slot == stub) return false;
-  DWORD old = 0;
-  if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
-  restored.emplace_back(slot, *slot);
-  *slot = stub;  // 原子指针替换
-  hooked_count.fetch_add(1, std::memory_order_relaxed);
-  VirtualProtect(slot, sizeof(void*), old, &old);
-  Log(reshade::log::level::info, (std::string("E_E_FPV: FPV stealth hooked ") + mod_name + "!" + func).c_str());
-  return true;
-}
-
-// 动态解析(XInput是运行时LoadLibrary+GetProcAddress拿的, IAT钩不到): 解析结果直接发假货
-static FARPROC WINAPI StubGetProcAddress(HMODULE mod, LPCSTR name) {
-  const FARPROC real = orig_gpa(mod, name);
-  static std::atomic_uint logs{0};
-  if (name && real && logs.load(std::memory_order_relaxed) < 12) {
-    const char* watch[] = {"XInputGetState", "XInputGetCapabilities", "joyGetPosEx", "HidP_GetCaps", "RegisterRawInputDevices", "DirectInput8Create"};
-    for (const char* w : watch)
-      if (!strcmp(name, w)) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "E_E_FPV stealth: GetProcAddress(%s) -> %s", name, armed.load() ? "stub" : "real");
-        Log(reshade::log::level::info, buf);
-        logs.fetch_add(1, std::memory_order_relaxed);
-        break;
-      }
-  }
-  if (!armed.load(std::memory_order_relaxed) || !name) return real;
-  if (!strcmp(name, "XInputGetState")) return reinterpret_cast<FARPROC>(StubXInputGetState);
-  if (!strcmp(name, "XInputGetCapabilities")) return reinterpret_cast<FARPROC>(StubXInputGetCapabilities);
-  if (!strcmp(name, "joyGetPosEx")) return reinterpret_cast<FARPROC>(StubJoyPosEx);
-  if (!strcmp(name, "joyGetDevCapsW") || !strcmp(name, "joyGetDevCapsA")) return reinterpret_cast<FARPROC>(StubJoyCaps);
-  if (!strcmp(name, "joyGetNumDevs")) return reinterpret_cast<FARPROC>(StubJoyNumDevs);
-  if (!strcmp(name, "RegisterRawInputDevices")) return reinterpret_cast<FARPROC>(StubRegisterRID);
-  if (!strcmp(name, "GetRawInputDeviceList")) return reinterpret_cast<FARPROC>(StubRawInputDeviceList);
-  if (!strcmp(name, "HidP_GetCaps")) return reinterpret_cast<FARPROC>(StubHidPGetCaps);
-  return real;
-}
-
-inline void Install() {
-  if (!orig_gpa) orig_gpa = reinterpret_cast<pfnGetProcAddress>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcAddress"));
-  const HMODULE user32 = GetModuleHandleW(L"user32.dll");
-  const HMODULE modules[] = {GetModuleHandleW(L"UnityPlayer.dll"), GetModuleHandleW(L"GameAssembly.dll"), GetModuleHandleW(nullptr)};
-  const char* names[] = {"UnityPlayer", "GameAssembly", "Endfield"};
-  bool any = false;
-  for (int i = 0; i < 3; ++i) {
-    if (!modules[i]) continue;
-    any |= PatchImport(modules[i], names[i], "winmm.dll", "joyGetNumDevs", StubJoyNumDevs);
-    any |= PatchImport(modules[i], names[i], "winmm.dll", "joyGetPosEx", StubJoyPosEx);
-    any |= PatchImport(modules[i], names[i], "winmm.dll", "joyGetDevCapsW", StubJoyCaps);
-    any |= PatchImport(modules[i], names[i], "user32.dll", "RegisterRawInputDevices", StubRegisterRID);
-    any |= PatchImport(modules[i], names[i], "user32.dll", "GetRawInputDeviceList", StubRawInputDeviceList);
-    if (!orig_ridiw) orig_ridiw = reinterpret_cast<pfnRawInputDeviceInfoW>(GetProcAddress(user32, "GetRawInputDeviceInfoW"));
-    if (orig_ridiw)
-      any |= PatchImport(modules[i], names[i], "user32.dll", "GetRawInputDeviceInfoW", StubRawInputDeviceInfoW);
-    if (!orig_hidp_getcaps) {
-      const HMODULE hid = GetModuleHandleW(L"hid.dll");
-      orig_hidp_getcaps = reinterpret_cast<pfnHidPGetCaps>(GetProcAddress(hid ? hid : LoadLibraryW(L"hid.dll"), "HidP_GetCaps"));
-    }
-    if (orig_hidp_getcaps)
-      any |= PatchImport(modules[i], names[i], "hid.dll", "HidP_GetCaps", StubHidPGetCaps);
-    any |= PatchImport(modules[i], names[i], "kernel32.dll", "GetProcAddress", StubGetProcAddress);
-    for (const char* xd : {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"}) {
-      any |= PatchImport(modules[i], names[i], xd, "XInputGetState", StubXInputGetState);
-      any |= PatchImport(modules[i], names[i], xd, "XInputGetCapabilities", StubXInputGetCapabilities);
-    }
-  }
-  installed.store(any, std::memory_order_relaxed);
-  complete.store(modules[1] != nullptr, std::memory_order_relaxed);
-}
-
-inline void Uninstall() {
-  if (!installed.load(std::memory_order_relaxed)) return;
-  for (auto& entry : restored) {
-    DWORD old = 0;
-    if (VirtualProtect(entry.first, sizeof(void*), PAGE_READWRITE, &old)) {
-      *entry.first = entry.second;
-      VirtualProtect(entry.first, sizeof(void*), old, &old);
-    }
-  }
-  restored.clear();
-  installed.store(false, std::memory_order_relaxed);
-}
-
-// 武装瞬间摘掉游戏已有的手柄 Raw Input 注册(我们自己模块的导入表未被钩, 直达真函数)
-inline void StripExistingGamepadRegistrations() {
-  const RAWINPUTDEVICE remove[2]{{0x01, 0x04, RIDEV_REMOVE, nullptr}, {0x01, 0x05, RIDEV_REMOVE, nullptr}};
-  RegisterRawInputDevices(remove, 2, sizeof(RAWINPUTDEVICE));
-}
-} // namespace stealth
+// 注: 原先这里有一层「隐身」——用 IAT 钩子把本进程里的手柄整个藏起来。
+// Linux 与 Windows 实测游戏都不会把 HID 遥控器当成手柄, 这层没用, 还会连累玩家自己的手柄, 已整体删除。
 
 inline float Expo(float command, float amount) {
   return amount * command * command * command + (1.f - amount) * command;
@@ -371,6 +169,9 @@ inline std::atomic_uint32_t raw[8] = {};    // 原始轴值(DI含滑条), overla
 inline std::atomic_int active_device{-1};   // 实际响应的 JOYSTICKID
 inline std::atomic_bool cal_travel{false};  // 行程校准进行中
 inline std::atomic_uint64_t travel_until{0};
+// 行程校准的扫描缓冲: 单独立一份, 扫的过程里不碰 cal[], 免得标定中途杆量乱跳
+inline float cal_scan_lo[8] = {};
+inline float cal_scan_hi[8] = {};
 inline float cal[8][3] = {};                // 每轴 {最小, 中心, 最大}
 inline std::atomic<float> vis_thr{0.f}, vis_yaw{0.f}, vis_pitch{0.f}, vis_roll{0.f};
 inline wchar_t device_name[128] = L"";
@@ -440,8 +241,35 @@ inline void LoadFromConfig() {
 }
 
 inline void StartTravelCalibration() {
+  // 关键: 初值铺成反的哨兵, 否则扫描值永远落在 [0, 65535] 里, 一个数都改不动
+  for (int i = 0; i < 8; ++i) {
+    cal_scan_lo[i] = 65536.f;
+    cal_scan_hi[i] = -1.f;
+  }
   travel_until.store(GetTickCount64() + 5000, std::memory_order_relaxed);
   cal_travel.store(true, std::memory_order_relaxed);
+}
+
+inline float TravelCalibrationLeft() {
+  const uint64_t end = travel_until.load(std::memory_order_relaxed);
+  const uint64_t now = GetTickCount64();
+  return end > now ? static_cast<float>(end - now) / 1000.f : 0.f;
+}
+
+// 扫完一圈: 只认这一轮真扫到行程的轴, 其余保持原标定不动
+inline void FinishTravelCalibration() {
+  for (int i = 0; i < 8; ++i) {
+    const float lo = cal_scan_lo[i];
+    const float hi = cal_scan_hi[i];
+    if (hi - lo < 2000.f) continue;  // 没动过 / 一路没信号, 跳过
+    cal[i][0] = lo;
+    cal[i][2] = hi;
+    // 中心必须严格落在新行程里面, 否则下次读配置会被当成坏数据整轴重置
+    if (!(lo < cal[i][1] && cal[i][1] < hi)) {
+      cal[i][1] = std::clamp((lo + hi) * 0.5f, lo + 1.f, hi - 1.f);
+    }
+  }
+  SaveToConfig();
 }
 
 inline void Poll() {
@@ -456,7 +284,7 @@ inline void Poll() {
     if (cal_travel.load(std::memory_order_relaxed)
         && GetTickCount64() > travel_until.load(std::memory_order_relaxed)) {
       cal_travel.store(false, std::memory_order_relaxed);
-      SaveToConfig();  // 行程校准结果落到内存表, 由主线程节流落盘
+      FinishTravelCalibration();  // 结果落到内存表, 由主线程节流落盘
     }
     DIJOYSTATE2 js{};
     const bool via_di = di::ready.load(std::memory_order_relaxed) && di::Read(&js);
@@ -498,16 +326,17 @@ inline void Poll() {
         wcsncpy(device_name, caps.szPname, 127), device_name[127] = 0;
       for (int i = 0; i < 6; ++i) raw[i].store(values[i], std::memory_order_relaxed);
     }
-    for (int i = 0; i < 8; ++i) {
-      if (cal_travel.load(std::memory_order_relaxed)) {
-        const DWORD v = raw[i].load(std::memory_order_relaxed);
-        if (v < cal[i][0]) cal[i][0] = static_cast<float>(v);
-        if (v > cal[i][2]) cal[i][2] = static_cast<float>(v);
+    if (cal_travel.load(std::memory_order_relaxed)) {
+      for (int i = 0; i < 8; ++i) {
+        const float v = static_cast<float>(raw[i].load(std::memory_order_relaxed));
+        if (v < cal_scan_lo[i]) cal_scan_lo[i] = v;
+        if (v > cal_scan_hi[i]) cal_scan_hi[i] = v;
       }
     }
     auto norm = [&](int axis) {
       const float lo = cal[axis][0], mid = cal[axis][1], hi = cal[axis][2];
-      const float v = static_cast<float>(values[axis]);
+      // raw[] 是两条输入路径统一后的 0..65535 原始值, values[] 只有 winmm 那条路会填
+      const float v = static_cast<float>(raw[axis].load(std::memory_order_relaxed));
       float out = v >= mid ? (v - mid) / (hi - mid + 0.001f) : (v - mid) / (mid - lo + 0.001f);
       out = std::clamp(out, -1.f, 1.f);
       const float m = std::abs(out);
@@ -1005,220 +834,222 @@ inline void ResyncModifiers() {
 
 // ---- 锚点迁移: 调引擎自带的 SetOverrideStreamingCenterByCamera, 让流式/LOD中心跟随FPV相机 ----
 namespace anchor {
+// 光照体积(IV)流送中心跟随相机。
+//
+// 定位过程留个记录, 免得以后重新踩一遍:
+//   class  HG.Rendering.Runtime.HGIrradianceVolumeManager @ HG.RenderPipelines.Runtime.dll
+//   method SetOverrideStreamingCenterByCamera(Camera)  —— 实例方法, 置一个模式标志
+//   field  m_overrideStreamingCenterByCamera : Boolean —— 就是那个标志
+//   实例   HGManagerContext.get_currentManagerContext().ivManager
+// 另外查过: 远处地形粗模由 HGTerrainGroundLayer(Clipmap).SetPlayerCenter 与
+// DynamicSceneGridDealer 的 streaming centers 决定, 而且都是"每帧被喂一次"的数据,
+// 想改必须钩游戏函数(动代码页)。评估后不纳入, 本项目不再新增钩子。
+inline bool api_ready = false;
 inline bool resolved = false;
-inline bool reported = false;
-inline bool invoked_ok = false;
+inline bool logged = false;
+inline std::atomic_bool engaged{false};            // 覆盖是否已经设上
+inline std::atomic_bool pending_reset{false};      // 复位只能回游戏线程做, 见 ConsumeReset
 inline Il2CppMethod set_override_by_camera = nullptr;
-inline int override_argc = 0;
-inline void* pipeline_obj = nullptr;
+inline int override_argc = 1;
+inline void* manager_class = nullptr;
+inline void* manager_instance = nullptr;
 
-using FieldStaticGet = void (*)(void*, void*);
-using ClassOfFn = void* (*)(void*);
-using GetMethodFromName = void* (*)(void*, const char*, int);
+using FnFieldStaticGet = void (*)(void*, void*);
+using FnFieldGetValue = void (*)(void*, void*, void*);
+using FnFieldSetValue = void (*)(void*, void*, void*);
+using FnClassGetName = const char* (*)(void*);
+using FnClassGetMethodFromName = void* (*)(void*, const char*, int);
+using FnImageGetClassCount = size_t (*)(Il2CppImage);
+using FnImageGetClass = void* (*)(Il2CppImage, size_t);
+using FnDomainGet = void* (*)();
+using FnDomainGetAssemblies = void** (*)(const void*, size_t*);
+using FnAssemblyGetImage = Il2CppImage (*)(const void*);
+
+inline FnFieldStaticGet field_static_get_value = nullptr;
+inline FnFieldGetValue field_get_value = nullptr;
+inline FnFieldSetValue field_set_value = nullptr;
+inline FnClassGetName class_get_name = nullptr;
+inline FnClassGetMethodFromName class_get_method_from_name = nullptr;
+inline FnImageGetClassCount image_get_class_count = nullptr;
+inline FnImageGetClass image_get_class = nullptr;
+inline FnDomainGet domain_get = nullptr;
+inline FnDomainGetAssemblies domain_get_assemblies = nullptr;
+inline FnAssemblyGetImage assembly_get_image = nullptr;
+
+inline void Warn(const char* what) {
+  char buf[192];
+  snprintf(buf, sizeof(buf), "E_E_FPV anchor: %s", what);
+  Log(reshade::log::level::warning, buf);
+}
+
+inline void ResolveApi() {
+  if (api_ready) return;
+  api_ready = true;
+  HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
+  if (!ga) { Warn("no GameAssembly"); return; }
+  ResolveExport(ga, "il2cpp_field_static_get_value", &field_static_get_value);
+  ResolveExport(ga, "il2cpp_field_get_value", &field_get_value);
+  ResolveExport(ga, "il2cpp_field_set_value", &field_set_value);
+  ResolveExport(ga, "il2cpp_class_get_name", &class_get_name);
+  ResolveExport(ga, "il2cpp_class_get_method_from_name", &class_get_method_from_name);
+  ResolveExport(ga, "il2cpp_image_get_class_count", &image_get_class_count);
+  ResolveExport(ga, "il2cpp_image_get_class", &image_get_class);
+  ResolveExport(ga, "il2cpp_domain_get", &domain_get);
+  ResolveExport(ga, "il2cpp_domain_get_assemblies", &domain_get_assemblies);
+  ResolveExport(ga, "il2cpp_assembly_get_image", &assembly_get_image);
+}
+
+// 按类名(不带命名空间)遍历全部程序集找类
+inline void* FindClassByName(const char* wanted) {
+  if (!domain_get || !domain_get_assemblies || !assembly_get_image
+      || !image_get_class_count || !image_get_class || !class_get_name) return nullptr;
+  void* domain = domain_get();
+  if (domain == nullptr) return nullptr;
+  size_t count = 0;
+  void** assemblies = domain_get_assemblies(domain, &count);
+  if (assemblies == nullptr) return nullptr;
+  for (size_t a = 0; a < count; ++a) {
+    Il2CppImage image = assembly_get_image(assemblies[a]);
+    if (image == nullptr) continue;
+    const size_t classes = image_get_class_count(image);
+    for (size_t i = 0; i < classes; ++i) {
+      void* type = image_get_class(image, i);
+      if (type == nullptr) continue;
+      const char* name = class_get_name(type);
+      if (name != nullptr && strcmp(name, wanted) == 0) return type;
+    }
+  }
+  return nullptr;
+}
+
+// 现取一份实例: 问 HGManagerContext.get_currentManagerContext() 要当前上下文, 再读它的 ivManager。
+// 不能缓太久 —— 管理器可能随场景重建, 拿旧指针写内存就是当场崩。
+inline void RefreshInstance() {
+  ResolveApi();
+  if (manager_class == nullptr) {
+    manager_class = FindClassByName("HGIrradianceVolumeManager");
+    if (manager_class == nullptr) return;
+  }
+  void* context_class = FindClassByName("HGManagerContext");
+  if (context_class == nullptr || !class_get_method_from_name
+      || !field_get_value || !field_set_value) return;
+  void* getter = class_get_method_from_name(context_class, "get_currentManagerContext", 0);
+  if (getter == nullptr) return;
+  void* exception = nullptr;
+  void* context = runtime_invoke(getter, nullptr, nullptr, &exception);
+  if (exception != nullptr || context == nullptr) return;
+  // ivManager 是 HGManagerContext 的私有字段, 偏移 88(实测); 按名字取一次更稳
+  static void* iv_field = nullptr;
+  if (iv_field == nullptr) {
+    void* field = nullptr;
+    void* parent = context_class;
+    // 字段可能声明在基类上, 顺着往上找
+    for (int depth = 0; parent != nullptr && depth < 6 && field == nullptr; ++depth) {
+      field = class_get_field_from_name(parent, "ivManager");
+      if (field == nullptr) {
+        HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
+        using Parent = void* (*)(void*);
+        Parent parent_of = nullptr;
+        if (ga && ResolveExport(ga, "il2cpp_class_get_parent", &parent_of) && parent_of) {
+          parent = parent_of(parent);
+        } else {
+          break;
+        }
+      }
+    }
+    iv_field = field;
+  }
+  if (iv_field == nullptr) return;
+  void* value = nullptr;
+  field_get_value(context, iv_field, &value);
+  if (value == nullptr) return;
+  manager_instance = value;
+}
 
 inline void Resolve() {
   if (resolved) return;
   resolved = true;
-  HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
-  if (!ga) return;
-  FieldStaticGet field_static_get_value = nullptr;
-  ClassOfFn object_get_class = nullptr;
-  GetMethodFromName class_get_method_from_name = nullptr;
-  if (!ResolveExport(ga, "il2cpp_field_static_get_value", &field_static_get_value)
-      || !ResolveExport(ga, "il2cpp_object_get_class", &object_get_class)
-      || !ResolveExport(ga, "il2cpp_class_get_method_from_name", &class_get_method_from_name))
-    return;
-  const auto core = FindImage("UnityEngine.CoreModule");
-  if (!core) return;
-  void* pipeline_manager = class_from_name(core, "UnityEngine.Rendering", "RenderPipelineManager");
-  if (!pipeline_manager) return;
-  void* field = class_get_field_from_name(pipeline_manager, "s_currentPipeline");
-  if (!field) return;
-  field_static_get_value(field, &pipeline_obj);
-  if (!pipeline_obj) return;
-  void* klass = object_get_class(pipeline_obj);
-  if (!klass) return;
-  for (int argc = 1; argc >= 0; --argc) {
-    set_override_by_camera = class_get_method_from_name(const_cast<void*>(klass), "SetOverrideStreamingCenterByCamera", argc);
-    if (set_override_by_camera) { override_argc = argc; break; }
+  ResolveApi();
+  if (manager_class == nullptr) manager_class = FindClassByName("HGIrradianceVolumeManager");
+  if (manager_class == nullptr) { Warn("class HGIrradianceVolumeManager not found"); return; }
+  if (class_get_method_from_name != nullptr) {
+    for (int argc = 1; argc >= 0; --argc) {
+      set_override_by_camera = class_get_method_from_name(manager_class, "SetOverrideStreamingCenterByCamera", argc);
+      if (set_override_by_camera != nullptr) { override_argc = argc; break; }
+    }
+  }
+  if (set_override_by_camera == nullptr) { Warn("method SetOverrideStreamingCenterByCamera not found"); return; }
+  RefreshInstance();
+  if (manager_instance == nullptr) { Warn("no instance (get_currentManagerContext)"); return; }
+  if (!logged) {
+    logged = true;
+    char buf[160];
+    snprintf(buf, sizeof(buf), "E_E_FPV anchor: ready — instance=%p (get_currentManagerContext().ivManager)", manager_instance);
+    Log(reshade::log::level::info, buf);
   }
 }
 
+// 只做一件事: 把模式标志置真, 让 IV 流送中心跟着相机
 inline void Update(void* camera) {
-  if (reported && invoked_ok) return;
   Resolve();
-  if (!set_override_by_camera || !camera) return;
-  // 实例方法优先挂管线对象, 静态则对象传空; 两种都试
+  if (set_override_by_camera == nullptr || camera == nullptr) return;
+  if (engaged.load(std::memory_order_relaxed)) return;
+  RefreshInstance();
+  if (manager_instance == nullptr) return;
   void* args[2] = {camera, nullptr};
   void* exception = nullptr;
   if (override_argc == 1) {
-    runtime_invoke(set_override_by_camera, pipeline_obj, args, &exception);
-    if (exception) runtime_invoke(set_override_by_camera, nullptr, args, &exception);
+    runtime_invoke(set_override_by_camera, manager_instance, args, &exception);
   } else {
-    runtime_invoke(set_override_by_camera, pipeline_obj, nullptr, &exception);
-    if (exception) runtime_invoke(set_override_by_camera, nullptr, nullptr, &exception);
+    runtime_invoke(set_override_by_camera, manager_instance, nullptr, &exception);
   }
-  if (!exception) invoked_ok = true;
-  if (!reported) {
-    reported = true;
-    char buf[128];
-    snprintf(buf, sizeof(buf), "E_E_FPV anchor: override streaming center %s (argc=%d, pipeline=%p)",
-             exception ? "invoke FAILED" : (invoked_ok ? "engaged" : "failed"), override_argc, pipeline_obj);
-    Log(reshade::log::level::info, buf);
-  }
-}
-// ---- 锚点迁移v2: Detour BaseGameScene.GetStreamingCenter, 网格流送中心直接=FPV相机位置 ----
-inline bool gsc_resolved = false;
-inline bool gsc_reported = false;
-using GSCFn = void (*)(Vec3*, void*);
-inline GSCFn orig_gsc = nullptr;
-
-inline void HookedGSC(Vec3* ret, void* self) {
-  orig_gsc(ret, self);
-  static std::atomic_uint gsc_calls{0};
-  const unsigned calls = gsc_calls.fetch_add(1, std::memory_order_relaxed);
-  if (calls < 5 || calls % 3000 == 0) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "E_E_FPV anchor: GSC call#%u orig=(%.0f,%.0f,%.0f) override=%d",
-             calls, ret ? ret->x : -1.f, ret ? ret->y : -1.f, ret ? ret->z : -1.f,
-             static_cast<int>(anchor_enabled >= .5f && requested.load() && active.load()));
-    Log(reshade::log::level::info, buf);
-  }
-  if (ret && anchor_enabled >= .5f && requested.load(std::memory_order_relaxed)
-      && active.load(std::memory_order_relaxed) && Finite(position)) {
-    *ret = position;
+  if (exception == nullptr) {
+    engaged.store(true, std::memory_order_relaxed);
+    Log(reshade::log::level::info, "E_E_FPV anchor: streaming center override engaged");
   }
 }
 
-inline bool ResolveGSC() {
-  if (gsc_resolved) return orig_gsc != nullptr;
-  gsc_resolved = true;
-  const auto image = FindImage("Gameplay.Beyond.dll");
-  if (!image) {
-    Log(reshade::log::level::warning, "E_E_FPV anchor: Beyond.Gameplay image not found");
-    return false;
-  }
-  auto* method = static_cast<MethodInfo*>(FindMethod(image, "Beyond.Gameplay.View", "BaseGameScene", "GetStreamingCenter", 0));
-  if (!method || !method->method_pointer) {
-    Log(reshade::log::level::warning, "E_E_FPV anchor: BaseGameScene.GetStreamingCenter not found");
-    return false;
-  }
-  orig_gsc = reinterpret_cast<GSCFn>(method->method_pointer);
-  const bool ok = native_hooks::Update("FPV anchor GetStreamingCenter", [&]() -> LONG {
-    return DetourAttach(reinterpret_cast<void**>(&orig_gsc), HookedGSC);
-  });
-  if (!gsc_reported) {
-    gsc_reported = true;
-    char buf[128];
-    snprintf(buf, sizeof(buf), "E_E_FPV anchor: GetStreamingCenter %s @%p", ok ? "hooked" : "hook FAILED", method->method_pointer);
-    Log(reshade::log::level::info, buf);
-  }
-  return ok;
-}
-// ---- 锚点迁移v3: Detour PlayerCenterUpdater 的坐标入口, 让中心更新器以为玩家=FPV相机 ----
-inline bool pcu_resolved = false;
-inline bool pcu_reported = false;
-using SetVecFn = void (*)(void*, Vec3*, void*);
-inline SetVecFn orig_set_proxy = nullptr;
-inline SetVecFn orig_set_override = nullptr;
-
-inline void PcRewrite(Vec3* v) {
-  if (v && anchor_enabled >= .5f && requested.load(std::memory_order_relaxed)
-      && active.load(std::memory_order_relaxed) && Finite(position)) *v = position;
-}
-
-inline void HookedSetProxy(void* self, Vec3* v, void* method) {
-  PcRewrite(v);
-  orig_set_proxy(self, v, method);
-}
-
-inline void HookedSetOverride(void* self, Vec3* v, void* method) {
-  PcRewrite(v);
-  orig_set_override(self, v, method);
-}
-
-using PcuTickFn = void (*)(void*, void*);
-inline PcuTickFn orig_pcu_tick = nullptr;
-
-// Tick后处理: 把 characterPositions[0] 覆写为FPV坐标(所有下游消费者下帧可见)
-inline void HookedPcuTick(void* self, void* method) {
-  orig_pcu_tick(self, method);
-  const bool armed = anchor_enabled >= .5f && requested.load(std::memory_order_relaxed)
-                     && active.load(std::memory_order_relaxed);
-  static bool refs_logged = false;
-  if (!refs_logged && self) {
-    refs_logged = true;
+// 撤销: m_overrideStreamingCenterByCamera 是 Boolean, 直接把这一位写 0。
+// 不调游戏代码, 就没有"传 null 会不会被解引用"的问题。
+// 必须在游戏线程上被调用(见 ConsumeReset) —— 从渲染线程摸游戏对象会崩。
+inline void Reset() {
+  if (!engaged.load(std::memory_order_relaxed)) return;
+  Resolve();
+  RefreshInstance();
+  if (manager_instance == nullptr) { Warn("reset skipped: no instance"); return; }
+  void* field = class_get_field_from_name(manager_class, "m_overrideStreamingCenterByCamera");
+  bool cleared = false;
+  if (field != nullptr && field_set_value != nullptr) {
+    uint8_t before = 0xFF;
+    if (field_get_value != nullptr) field_get_value(manager_instance, field, &before);
+    uint8_t off = 0;
+    field_set_value(manager_instance, field, &off);
+    cleared = true;
     char buf[160];
-    snprintf(buf, sizeof(buf), "E_E_FPV anchor: PCU refs centerRef=%p centerProxy=%p charPos=%p",
-             *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 128),
-             *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 136),
-             *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 152));
+    snprintf(buf, sizeof(buf), "E_E_FPV anchor: reset — flag 0 (was %u)", static_cast<unsigned>(before));
     Log(reshade::log::level::info, buf);
+  } else if (set_override_by_camera != nullptr && override_argc == 1) {
+    void* args[1] = {nullptr};
+    void* exception = nullptr;
+    runtime_invoke(set_override_by_camera, manager_instance, args, &exception);
+    cleared = exception == nullptr;
   }
-  if (!armed || !self) return;
-  void* container = *reinterpret_cast<void**>(static_cast<uint8_t*>(self) + 152);
-  if (!container) return;
-  // 启发式: +8为合理长度(1..64)且+0为指针 → NativeArray(数据@0); 否则按il2cpp数组(长度@0x18, 数据@0x20)
-  void* data = nullptr;
-  const unsigned long long len_native = *reinterpret_cast<unsigned long long*>(static_cast<uint8_t*>(container) + 8);
-  if (len_native >= 1 && len_native <= 64) data = *reinterpret_cast<void**>(container);
-  if (!data) {
-    const unsigned long long len_arr = *reinterpret_cast<unsigned long long*>(static_cast<uint8_t*>(container) + 0x18);
-    if (len_arr >= 1 && len_arr <= 64) data = static_cast<uint8_t*>(container) + 0x20;
-  }
-  if (data) *reinterpret_cast<Vec3*>(data) = position;
+  if (!cleared) Warn("reset FAILED");
+  engaged.store(false, std::memory_order_relaxed);
 }
 
-inline bool ResolvePCU() {
-  if (pcu_resolved) return true;
-  pcu_resolved = true;
-  const auto image = FindImage("Gameplay.Beyond.dll");
-  if (!image) return false;
-  void* klass = class_from_name(image, "Beyond.Gameplay.Core", "PlayerCenterUpdater");
-  if (!klass) {
-    Log(reshade::log::level::warning, "E_E_FPV anchor: PlayerCenterUpdater class not found");
-    return false;
-  }
-  HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
-  using GetMethodFn = void* (*)(void*, const char*, int);
-  GetMethodFn get_method = nullptr;
-  if (!ga || !ResolveExport(ga, "il2cpp_class_get_method_from_name", &get_method)) return false;
-  auto* proxy_m = static_cast<MethodInfo*>(get_method(klass, "SetProxyPosition", 1));
-  auto* override_m = static_cast<MethodInfo*>(get_method(klass, "SetOverridePosition", 1));
-  if ((!proxy_m || !proxy_m->method_pointer) && (!override_m || !override_m->method_pointer)) {
-    Log(reshade::log::level::warning, "E_E_FPV anchor: PCU position setters not found");
-    return false;
-  }
-  bool ok = true;
-  if (proxy_m && proxy_m->method_pointer) {
-    orig_set_proxy = reinterpret_cast<SetVecFn>(proxy_m->method_pointer);
-    ok &= native_hooks::Update("FPV anchor SetProxyPosition", [&]() -> LONG {
-      return DetourAttach(reinterpret_cast<void**>(&orig_set_proxy), HookedSetProxy);
-    });
-  }
-  if (override_m && override_m->method_pointer) {
-    orig_set_override = reinterpret_cast<SetVecFn>(override_m->method_pointer);
-    ok &= native_hooks::Update("FPV anchor SetOverridePosition", [&]() -> LONG {
-      return DetourAttach(reinterpret_cast<void**>(&orig_set_override), HookedSetOverride);
-    });
-  }
-  // Tick钩子: 每帧把 characterPositions[0] 覆写为FPV坐标(原逻辑执行后)
-  auto* tick_m = static_cast<MethodInfo*>(get_method(klass, "Tick", 0));
-  if (tick_m && tick_m->method_pointer) {
-    orig_pcu_tick = reinterpret_cast<PcuTickFn>(tick_m->method_pointer);
-    ok &= native_hooks::Update("FPV anchor PCU Tick", [&]() -> LONG {
-      return DetourAttach(reinterpret_cast<void**>(&orig_pcu_tick), HookedPcuTick);
-    });
-  }
-  if (!pcu_reported) {
-    pcu_reported = true;
-    char buf[128];
-    snprintf(buf, sizeof(buf), "E_E_FPV anchor: PlayerCenterUpdater setters %s (proxy=%d override=%d)",
-             ok ? "hooked" : "hook FAILED", proxy_m && proxy_m->method_pointer ? 1 : 0,
-             override_m && override_m->method_pointer ? 1 : 0);
-    Log(reshade::log::level::info, buf);
-  }
-  return ok;
+// 游戏线程每帧调用: 真正执行复位
+inline void ConsumeReset() {
+  if (pending_reset.exchange(false, std::memory_order_relaxed)) Reset();
+}
+
+// 每帧看一次武装状态(锚点迁移开着 + FPV 开着 + 自由相机开着), 只在边沿上动作。
+// 复位只挂待办, 由游戏线程的 ConsumeReset 执行。
+inline void Poll(bool armed) {
+  static bool armed_last = false;
+  if (armed && !armed_last) Resolve();
+  if (armed_last && !armed) pending_reset.store(true, std::memory_order_relaxed);
+  armed_last = armed;
 }
 } // namespace anchor
 

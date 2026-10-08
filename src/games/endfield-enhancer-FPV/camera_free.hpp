@@ -186,8 +186,6 @@ inline bool Apply(void* brain, void* state, MethodInfo* method) {
     if (fpv::requested.load(std::memory_order_relaxed)) {
       if (fpv::anchor_enabled >= .5f) {
         fpv::anchor::Update(Invoke(motion::output_camera, brain));
-        fpv::anchor::ResolveGSC();
-        fpv::anchor::ResolvePCU();
       }
       fpv::Tick(dt, sample.move, sample.yaw, sample.pitch);
       position = fpv::position;

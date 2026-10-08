@@ -1,0 +1,38 @@
+[submodule "external/reshade"]
+  path = external/reshade
+  url = https://github.com/crosire/reshade
+
+[submodule "external/Streamline"]
+  path = external/Streamline
+  url = https://github.com/clshortfuse/Streamline.git
+  branch = patch-1
+
+[submodule "external/gtl"]
+  path = external/gtl
+  url = https://github.com/greg7mdp/gtl.git
+
+[submodule "external/DLSS"]
+  path = external/DLSS
+  url = https://github.com/NVIDIA/DLSS.git
+
+[submodule "external/Detours"]
+  path = external/Detours
+  url = https://github.com/microsoft/Detours.git
+[submodule "external/frozen"]
+	path = external/frozen
+	url = https://github.com/serge-sans-paille/frozen.git
+[submodule "external/DirectXTex"]
+	path = external/DirectXTex
+	url = https://github.com/microsoft/DirectXTex.git
+[submodule "external/openexr"]
+	path = external/openexr
+	url = https://github.com/AcademySoftwareFoundation/openexr.git
+[submodule "Imath"]
+	path = Imath
+	url = https://github.com/AcademySoftwareFoundation/Imath.git
+[submodule "external/Imath"]
+	path = external/Imath
+	url = https://github.com/AcademySoftwareFoundation/Imath.git
+[submodule "external/json"]
+	path = external/json
+	url = https://github.com/nlohmann/json.git

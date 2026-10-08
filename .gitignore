@@ -1,0 +1,83 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+build/**
+build32/**
+build.ninja/**
+build32.ninja/**
+build.vs/**
+build32.vs/**
+
+bin/**
+**/.vshistory/
+.cache/**
+__pycache__/
+*.py[cod]
+
+# Local modder deployment options and secrets
+.env
+.env.*
+!.env.example
+.vscode/mcp.json
+.kiro/
+.tmp/
+.codex-dumps/
+.dotnet/
+.test/
+.venv-analysis/
+# Local temporary files and test folders at any depth
+tmp/
+tests/
+
+# Local workspace tools (not addon sources)
+/tools/
+
+# Local Endfield regression fixtures and evidence
+/test/cross_addon_lifecycle/
+
+# Local DevKit regression fixtures
+/test/devkit_resource_analysis/
+
+# Local Endfield camera validation
+/src/games/endfield-enhancer-FPV/validation/
+
+# 本地 Linux 交叉编译目录 (含 CMakeCache, 里面有绝对路径)
+build-linux/
+build-linux-*/
+
+# 发布脚本输出目录
+githubrelease/
+
+# 构建产物: 走 Release 附件分发, 不入库
+*.addon64
+*.addon32
