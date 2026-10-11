@@ -137,3 +137,5 @@ cmake --build build --target endfield-enhancer-FPV -j32
 
 本修改版在上述作品的基础上构建，完整保留了原有的许可证文本与版权声明；
 本仓库新增与修改的部分，同样以 MIT License 发布。
+
+此项目已归档,此mod已被《明日方舟终末地》游戏所警告，不再推荐使用。
